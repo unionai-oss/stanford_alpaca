@@ -14,15 +14,20 @@
 
 import copy
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Sequence
 
 import torch
 import transformers
+from flytekit import Resources
 from torch.utils.data import Dataset
 from transformers import Trainer
 
 import utils
+import flytekit
+from flytekitplugins.kfpytorch.task import Elastic
+from dataclasses_json import dataclass_json
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -43,16 +48,19 @@ PROMPT_DICT = {
 }
 
 
+@dataclass_json
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
 
 
+@dataclass_json
 @dataclass
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
 
 
+@dataclass_json
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
@@ -189,10 +197,18 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 
-def train():
-    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
+# TODO: update the Dockerfile for use with cuda
+@flytekit.task(
+    task_config=Elastic(nnodes=1),
+    environment={
+        "TRANSFORMERS_CACHE": "/tmp",
+        "WANDB_API_KEY": "<wandb_key>",
+        "WANDB_PROJECT": "unioncloud-llms",
+    },
+    requests=Resources(mem="40Gi", cpu="1", gpu="1"),
+)
+def train(model_args: ModelArguments, data_args: DataArguments, training_args: TrainingArguments) -> flytekit.file.FlyteFile:
+    os.environ["WANDB_RUN_ID"] = os.environ.get("FLYTE_INTERNAL_EXECUTION_ID", "foo")
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -225,6 +241,18 @@ def train():
     trainer.train()
     trainer.save_state()
     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+    return flytekit.file.FlyteFile(path=training_args.output_dir)
+
+
+@flytekit.workflow
+def train_wf(model_args: ModelArguments, data_args: DataArguments, training_args: TrainingArguments) -> flytekit.file.FlyteFile:
+    return train(model_args=model_args, data_args=data_args, training_args=training_args)
+
+
+def train_cli():
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    train(model_args, data_args, training_args)
 
 
 if __name__ == "__main__":
